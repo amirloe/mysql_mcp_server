@@ -1,10 +1,11 @@
 import asyncio
 import logging
 import os
-from mysql.connector import connect, Error
+from sqlalchemy import create_engine as sqlalchemy_create_engine
 from mcp.server import Server
 from mcp.types import Resource, Tool, TextContent
 from pydantic import AnyUrl
+from mysql.connector import Error
 
 # Configure logging
 logging.basicConfig(
@@ -13,6 +14,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mysql_mcp_server")
 
+
+def create_engine(config):
+    MYSQL_URL_SERJ = f"mysql+mysqlconnector://{config['user']}:{config['password']}@{config['host']}:{config['port']}/{config['database']}"
+    return sqlalchemy_create_engine(
+        MYSQL_URL_SERJ,
+        connect_args={
+            "ssl_ca": config["ssl_ca"],
+            "ssl_verify_cert": True
+        } if "ssl_ca" in config else {}
+    )
+
 def get_db_config():
     """Get database configuration from environment variables."""
     config = {
@@ -20,13 +32,27 @@ def get_db_config():
         "port": int(os.getenv("MYSQL_PORT", "3306")),
         "user": os.getenv("MYSQL_USER"),
         "password": os.getenv("MYSQL_PASSWORD"),
-        "database": os.getenv("MYSQL_DATABASE")
+        "database": os.getenv("MYSQL_DATABASE"),
+        "ssl_ca": os.getenv("MYSQL_SSL_CA")
     }
     
     if not all([config["user"], config["password"], config["database"]]):
         logger.error("Missing required database configuration. Please check environment variables:")
         logger.error("MYSQL_USER, MYSQL_PASSWORD, and MYSQL_DATABASE are required")
         raise ValueError("Missing required database configuration")
+    
+    # Configure SSL if certificate is provided
+    if config["ssl_ca"]:
+        # For DigitalOcean and other managed MySQL services, we need to set these SSL options
+        if os.path.exists(config["ssl_ca"]):
+            logger.info(f"Using SSL/TLS with CA certificate: {config['ssl_ca']}")
+            config["ssl_verify_cert"] = True
+            config["ssl_verify_identity"] = True
+        else:
+            logger.error(f"SSL CA certificate file not found: {config['ssl_ca']}")
+            raise ValueError(f"SSL CA certificate file not found: {config['ssl_ca']}")
+    else:
+        config.pop("ssl_ca", None)
     
     return config
 
@@ -38,23 +64,23 @@ async def list_resources() -> list[Resource]:
     """List MySQL tables as resources."""
     config = get_db_config()
     try:
-        with connect(**config) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SHOW TABLES")
-                tables = cursor.fetchall()
-                logger.info(f"Found tables: {tables}")
-                
-                resources = []
-                for table in tables:
-                    resources.append(
-                        Resource(
-                            uri=f"mysql://{table[0]}/data",
-                            name=f"Table: {table[0]}",
-                            mimeType="text/plain",
-                            description=f"Data in table: {table[0]}"
-                        )
+        engine = create_engine(config)
+        with engine.raw_connection().cursor() as cursor:
+            cursor.execute("SHOW TABLES")
+            tables = cursor.fetchall()
+            logger.info(f"Found tables: {tables}")
+            
+            resources = []
+            for table in tables:
+                resources.append(
+                    Resource(
+                        uri=f"mysql://{table[0]}/data",
+                        name=f"Table: {table[0]}",
+                        mimeType="text/plain",
+                        description=f"Data in table: {table[0]}"
                     )
-                return resources
+                )
+            return resources
     except Error as e:
         logger.error(f"Failed to list resources: {str(e)}")
         return []
@@ -73,15 +99,22 @@ async def read_resource(uri: AnyUrl) -> str:
     table = parts[0]
     
     try:
-        with connect(**config) as conn:
-            with conn.cursor() as cursor:
+        engine = create_engine(config)
+        conn = engine.raw_connection()
+        try:
+            cursor = conn.cursor()
+            try:
                 cursor.execute(f"SELECT * FROM {table} LIMIT 100")
                 columns = [desc[0] for desc in cursor.description]
                 rows = cursor.fetchall()
                 result = [",".join(map(str, row)) for row in rows]
                 return "\n".join([",".join(columns)] + result)
+            finally:
+                cursor.close()
+        finally:
+            conn.close()
                 
-    except Error as e:
+    except Exception as e:
         logger.error(f"Database error reading resource {uri}: {str(e)}")
         raise RuntimeError(f"Database error: {str(e)}")
 
@@ -120,8 +153,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         raise ValueError("Query is required")
     
     try:
-        with connect(**config) as conn:
-            with conn.cursor() as cursor:
+        engine = create_engine(config)
+        conn = engine.raw_connection()
+        try:
+            cursor = conn.cursor()
+            try:
                 cursor.execute(query)
                 
                 # Special handling for SHOW TABLES
@@ -142,8 +178,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 else:
                     conn.commit()
                     return [TextContent(type="text", text=f"Query executed successfully. Rows affected: {cursor.rowcount}")]
+            finally:
+                cursor.close()
+        finally:
+            conn.close()
                 
-    except Error as e:
+    except Exception as e:
         logger.error(f"Error executing SQL '{query}': {e}")
         return [TextContent(type="text", text=f"Error executing query: {str(e)}")]
 
